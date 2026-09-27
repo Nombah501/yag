@@ -1,9 +1,15 @@
 // ==UserScript==
 // @name         Yandex Games — Ad Suppression
 // @namespace    local.yandex.games
-// @version      1.3.3
+// @version      1.4.0
 // @description  Suppress Yandex Games advertising surfaces
-// @match        https://yandex.ru/games/*
+// @match        https://yandex.ru/games*
+// @match        https://yandex.com/games*
+// @match        https://yandex.kz/games*
+// @match        https://yandex.by/games*
+// @match        https://yandex.uz/games*
+// @match        https://yandex.com.tr/games*
+// @match        https://playhop.com/*
 // @match        https://*.games.s3.yandex.net/*
 // @match        https://games-storage.yandex.net/*
 // @match        https://*.cdn.games.yandex.net/*
@@ -11,12 +17,14 @@
 // @match        https://games-storage-awst.yandex.net/*
 // @run-at       document-start
 // @sandbox      raw
+// @inject-into  page
 // @grant        GM_getValue
 // @grant        GM_setValue
-// @updateURL    https://raw.githubusercontent.com/Nombah501/yag/main/yag.user.js
-// @downloadURL  https://raw.githubusercontent.com/Nombah501/yag/main/yag.user.js
 // @grant        GM_addValueChangeListener
 // @grant        GM_registerMenuCommand
+// @grant        GM_unregisterMenuCommand
+// @updateURL    https://raw.githubusercontent.com/Nombah501/yag/main/yag.user.js
+// @downloadURL  https://raw.githubusercontent.com/Nombah501/yag/main/yag.user.js
 // ==/UserScript==
 
 (function () {
@@ -24,7 +32,7 @@
 
     var LOG_PREFIX = '[yagames-ad-filter]';
     var ENABLED_KEY = 'enabled';
-    var MENU_TITLE = 'Yandex Games: toggle ad suppression';
+    var DEBUG_KEY = 'debug';
     var STYLE_ID = 'yagames-ad-filter-style';
     var STATE_EVENT = 'yagames-ad-filter:state';
 
@@ -46,13 +54,26 @@
 
     // ====================================================================
     // PAGE-WORLD HOOK — injected as an inline <script> so it runs in the
-    // page's own JavaScript world regardless of the Tampermonkey sandbox
-    // mode (raw or isolated). Idempotent via a window flag.
+    // page's own JavaScript world regardless of the sandbox mode. When CSP
+    // blocks the inline script, it is called directly in the userscript
+    // world instead (effective under `@sandbox raw` / `@inject-into page`).
+    // Idempotent via a window flag; reports installation through the
+    // DOM marker `data-yagames-ad-filter`, which is visible to every world.
     // ====================================================================
 
-    function pageHook() {
-        if (window.__yagamesAdFilterInstalled) return;
+    function pageHook(initialEnabled, initialDebug) {
+        var ROOT_MARKER = 'yagamesAdFilter';
+
+        function markInstalled() {
+            try {
+                var root = document.documentElement;
+                if (root) root.dataset[ROOT_MARKER] = '1';
+            } catch (e) { /* marker is best-effort */ }
+        }
+
+        if (window.__yagamesAdFilterInstalled) { markInstalled(); return; }
         window.__yagamesAdFilterInstalled = true;
+        markInstalled();
 
         var LOG_PREFIX = '[yagames-ad-filter]';
         var SDK_MARKER = Symbol.for('yagames-ad-filter.sdk');
@@ -61,19 +82,12 @@
         var POLL_TIMEOUT_MS = 30000;
         var IS_HOST = window.top === window;
         var BLOCKED_ACTIONS = ['adv-show-fullscreen', 'adv-show-rewarded-video'];
-        var enabled = true;
-
-        window.addEventListener('yagames-ad-filter:state', function (ev) {
-            try {
-                var detail = ev && ev.detail;
-                if (detail && typeof detail.enabled === 'boolean') {
-                    enabled = detail.enabled;
-                    log('state -> ' + (enabled ? 'enabled' : 'disabled'));
-                }
-            } catch (e) { /* ignore */ }
-        });
+        var BANNER_OFF = { stickyAdvIsShowing: false, reason: 'ADV_IS_NOT_CONNECTED' };
+        var enabled = initialEnabled !== false;
+        var debug = initialDebug === true;
 
         function log(message) {
+            if (!debug) return;
             try { console.log(LOG_PREFIX, message); } catch (e) { /* silent */ }
         }
 
@@ -81,85 +95,65 @@
             try { console.warn(LOG_PREFIX, message); } catch (e) { /* silent */ }
         }
 
-        function schedule(fn) {
+        window.addEventListener('yagames-ad-filter:state', function (ev) {
             try {
-                if (typeof queueMicrotask === 'function') queueMicrotask(fn);
-                else Promise.resolve().then(fn);
-            } catch (e) { log('scheduling failed: ' + e); }
-        }
+                var detail = ev && ev.detail;
+                // Userscript worlds send JSON strings: objects created in an
+                // isolated world are unreadable from the page world (Xray).
+                if (typeof detail === 'string') detail = JSON.parse(detail);
+                if (!detail) return;
+                if (typeof detail.debug === 'boolean') debug = detail.debug;
+                if (typeof detail.enabled === 'boolean' && detail.enabled !== enabled) {
+                    enabled = detail.enabled;
+                    log('state -> ' + (enabled ? 'enabled' : 'disabled'));
+                }
+            } catch (e) { /* ignore */ }
+        });
 
-        function safeCall(fn) {
+        // Runs fn(arg) on a microtask; a throwing callback never affects the others.
+        function callLater(fn, arg) {
             if (typeof fn !== 'function') return;
-            schedule(function () {
-                try { fn(); } catch (e) { log('callback threw: ' + e); }
+            Promise.resolve().then(function () {
+                try { fn(arg); } catch (e) { log('callback threw: ' + e); }
             });
         }
 
-        // --- adv wrappers ---------------------------------------------------
+        function readCallbacks(options) {
+            try {
+                if (options && typeof options === 'object' &&
+                    options.callbacks && typeof options.callbacks === 'object') {
+                    return options.callbacks;
+                }
+            } catch (e) { /* malformed options treated as empty callbacks */ }
+            return {};
+        }
 
-        function makeRewardedWrapper(original) {
-            return function showRewardedVideo(options) {
+        // --- adv stubs --------------------------------------------------------
+        // Each stub replaces one sdk.adv method while suppression is enabled.
+
+        var ADV_STUBS = {
+            showRewardedVideo: function (cb) {
+                callLater(cb.onOpen);
+                callLater(cb.onRewarded);
+                callLater(cb.onClose, true);
+            },
+            showFullscreenAdv: function (cb) {
+                callLater(cb.onClose, false);
+            },
+            showBannerAdv: function () { return Promise.resolve(BANNER_OFF); },
+            getBannerAdvStatus: function () { return Promise.resolve(BANNER_OFF); },
+            hideBannerAdv: function () { return Promise.resolve({ stickyAdvIsShowing: false }); }
+        };
+
+        function makeWrapper(name, original, stub) {
+            return function () {
                 if (!enabled) return Reflect.apply(original, this, arguments);
-                log('showRewardedVideo intercepted @ ' + location.href);
-                var callbacks = {};
-                try {
-                    if (options && typeof options === 'object' &&
-                        options.callbacks && typeof options.callbacks === 'object') {
-                        callbacks = options.callbacks;
-                    }
-                } catch (e) { /* malformed options treated as empty callbacks */ }
-                safeCall(callbacks.onOpen);
-                safeCall(callbacks.onRewarded);
-                safeCall(function () { callbacks.onClose(true); });
-                return undefined;
+                log(name + ' intercepted @ ' + location.href);
+                return stub(readCallbacks(arguments[0]));
             };
         }
 
-        function makeFullscreenWrapper(original) {
-            return function showFullscreenAdv(options) {
-                if (!enabled) return Reflect.apply(original, this, arguments);
-                log('showFullscreenAdv intercepted @ ' + location.href);
-                var callbacks = {};
-                try {
-                    if (options && typeof options === 'object' &&
-                        options.callbacks && typeof options.callbacks === 'object') {
-                        callbacks = options.callbacks;
-                    }
-                } catch (e) { /* malformed options treated as empty callbacks */ }
-                var onClose = callbacks.onClose;
-                schedule(function () {
-                    if (typeof onClose !== 'function') return;
-                    try { onClose(false); } catch (e) { log('onClose threw: ' + e); }
-                });
-                return undefined;
-            };
-        }
-
-        function makeShowBannerWrapper(original) {
-            return function showBannerAdv() {
-                if (!enabled) return Reflect.apply(original, this, arguments);
-                log('showBannerAdv intercepted @ ' + location.href);
-                return Promise.resolve({ stickyAdvIsShowing: false, reason: 'ADV_IS_NOT_CONNECTED' });
-            };
-        }
-
-        function makeGetBannerStatusWrapper(original) {
-            return function getBannerAdvStatus() {
-                if (!enabled) return Reflect.apply(original, this, arguments);
-                log('getBannerAdvStatus intercepted @ ' + location.href);
-                return Promise.resolve({ stickyAdvIsShowing: false, reason: 'ADV_IS_NOT_CONNECTED' });
-            };
-        }
-
-        function makeHideBannerWrapper(original) {
-            return function hideBannerAdv() {
-                if (!enabled) return Reflect.apply(original, this, arguments);
-                log('hideBannerAdv intercepted @ ' + location.href);
-                return Promise.resolve({ stickyAdvIsShowing: false });
-            };
-        }
-
-        function wrapAdvMethod(adv, name, makeWrapper) {
+        function wrapAdvMethod(adv, name) {
             try {
                 var desc = null;
                 try { desc = Object.getOwnPropertyDescriptor(adv, name); } catch (e) { /* probe failed */ }
@@ -168,8 +162,8 @@
                     return;
                 }
                 var original = typeof adv[name] === 'function' ? adv[name] : null;
-                if (!original) { warn('adv.' + name + ' is not a function; skipping'); return; }
-                var wrapper = makeWrapper(original);
+                if (!original) { log('adv.' + name + ' is not a function; skipping'); return; }
+                var wrapper = makeWrapper(name, original, ADV_STUBS[name]);
                 try {
                     Object.defineProperty(adv, name, { value: wrapper, writable: true, configurable: true });
                 } catch (e) {
@@ -197,11 +191,7 @@
                 if (!adv || typeof adv !== 'object') {
                     log('sdk.adv missing; no adv surface patched');
                 } else {
-                    wrapAdvMethod(adv, 'showRewardedVideo', makeRewardedWrapper);
-                    wrapAdvMethod(adv, 'showFullscreenAdv', makeFullscreenWrapper);
-                    wrapAdvMethod(adv, 'showBannerAdv', makeShowBannerWrapper);
-                    wrapAdvMethod(adv, 'getBannerAdvStatus', makeGetBannerStatusWrapper);
-                    wrapAdvMethod(adv, 'hideBannerAdv', makeHideBannerWrapper);
+                    Object.keys(ADV_STUBS).forEach(function (name) { wrapAdvMethod(adv, name); });
                 }
                 try {
                     Object.defineProperty(sdk, SDK_MARKER, { value: true, enumerable: false, configurable: false });
@@ -212,33 +202,21 @@
             }
         }
 
+        // Returns true once `api` is patched (now or earlier); false means
+        // "retry later" — e.g. YaGames was assigned before its init existed.
         function patchApi(api) {
             try {
-                if (!api || (typeof api !== 'object' && typeof api !== 'function')) return;
-                if (api[API_MARKER]) return;
-                if (typeof api.init !== 'function') {
-                    log('YaGames.init not present at assignment time');
-                    return;
-                }
+                if (!api || (typeof api !== 'object' && typeof api !== 'function')) return false;
+                if (api[API_MARKER]) return true;
+                if (typeof api.init !== 'function') return false;
                 var origInit = api.init;
                 var wrappedInit = function init() {
-                    var self = this;
-                    var args = arguments;
-                    var result;
-                    try {
-                        result = Reflect.apply(origInit, self, args);
-                    } catch (e) {
-                        warn('original YaGames.init threw: ' + e);
-                        throw e;
-                    }
+                    var result = Reflect.apply(origInit, this, arguments);
                     try {
                         if (result && typeof result.then === 'function') {
                             return Promise.resolve(result).then(function (sdk) {
                                 patchSdk(sdk);
                                 return sdk;
-                            }, function (err) {
-                                log('YaGames.init rejected; passing rejection through');
-                                throw err;
                             });
                         }
                         patchSdk(result);
@@ -252,22 +230,31 @@
                 } catch (e) {
                     try { api.init = wrappedInit; } catch (e2) {
                         warn('cannot wrap YaGames.init; adv callbacks uncovered');
-                        return;
+                        return true;
                     }
                 }
                 try {
                     Object.defineProperty(api, API_MARKER, { value: true, enumerable: false, configurable: false });
                 } catch (e) { /* marker is best-effort */ }
                 log('YaGames.init wrapped @ ' + location.href + (IS_HOST ? ' (host)' : ' (iframe)'));
+                return true;
             } catch (e) {
                 warn('patchApi failed: ' + e);
+                return true;
             }
         }
 
         // --- YaGames hook -------------------------------------------------------
+        // The accessor catches plain assignment instantly. The poll runs for the
+        // full timeout regardless, because the SDK may replace the accessor with
+        // Object.defineProperty or add `init` after assigning the object.
 
-        function defineYaGamesGetterSetter(initialValue) {
-            var captured = initialValue;
+        function installYaGamesAccessor() {
+            var desc = null;
+            try { desc = Object.getOwnPropertyDescriptor(window, 'YaGames'); } catch (e) { /* probe failed */ }
+            if (desc && !desc.configurable) return;
+            var captured;
+            try { captured = desc ? (desc.get ? desc.get.call(window) : desc.value) : undefined; } catch (e) { /* keep undefined */ }
             try {
                 Object.defineProperty(window, 'YaGames', {
                     configurable: true,
@@ -280,38 +267,27 @@
                 log('YaGames setter installed @ ' + location.href);
             } catch (e) {
                 warn('cannot install YaGames setter: ' + e);
-                pollYaGames();
             }
         }
 
         function pollYaGames() {
             var deadline = Date.now() + POLL_TIMEOUT_MS;
+            var seenPatched = false;
             var timer = setInterval(function () {
                 try {
                     var api = window.YaGames;
-                    if (api) { clearInterval(timer); patchApi(api); return; }
-                    if (Date.now() >= deadline) {
-                        clearInterval(timer);
-                        warn('YaGames not observed within 30s');
-                    }
-                } catch (e) {
+                    if (api) seenPatched = patchApi(api) || seenPatched;
+                } catch (e) { /* retry next tick */ }
+                if (Date.now() >= deadline) {
                     clearInterval(timer);
-                    warn('YaGames polling aborted: ' + e);
+                    if (!seenPatched) log('YaGames not patched within ' + POLL_TIMEOUT_MS + 'ms');
                 }
             }, POLL_INTERVAL_MS);
         }
 
         function hookYaGames() {
-            var desc = null;
-            try { desc = Object.getOwnPropertyDescriptor(window, 'YaGames'); } catch (e) { /* probe failed */ }
-            if (!desc) { defineYaGamesGetterSetter(undefined); return; }
-            if (desc.configurable) {
-                var current = null;
-                try { current = desc.get ? desc.get.call(window) : desc.value; } catch (e) { /* keep null */ }
-                defineYaGamesGetterSetter(current);
-                return;
-            }
-            if (window.YaGames) patchApi(window.YaGames);
+            installYaGamesAccessor();
+            try { if (window.YaGames) patchApi(window.YaGames); } catch (e) { /* poll retries */ }
             pollYaGames();
         }
 
@@ -346,7 +322,27 @@
     // USERSCRIPT CONTEXT — GM storage, menu, host CSS, state sync
     // ====================================================================
 
+    var IS_TOP = window.top === window;
+    var menuIds = [];
+
+    function readFlag(key, fallback) {
+        try {
+            var value = GM_getValue(key);
+            return value === undefined ? fallback : !!value;
+        } catch (e) {
+            return fallback;
+        }
+    }
+
+    function isEnabled() { return readFlag(ENABLED_KEY, true); }
+    function isDebug() { return readFlag(DEBUG_KEY, false); }
+
+    function writeFlag(key, value) {
+        try { GM_setValue(key, !!value); } catch (e) { /* silent */ }
+    }
+
     function logDebug(message) {
+        if (!isDebug()) return;
         try { console.log(LOG_PREFIX, message); } catch (e) { /* silent */ }
     }
 
@@ -354,38 +350,13 @@
         try { console.warn(LOG_PREFIX, message); } catch (e) { /* silent */ }
     }
 
-    function isEnabled() {
+    function pushState() {
         try {
-            var value = GM_getValue(ENABLED_KEY);
-            return value === undefined ? true : !!value;
-        } catch (e) {
-            return true;
-        }
-    }
-
-    function setEnabled(value) {
-        try { GM_setValue(ENABLED_KEY, !!value); } catch (e) { /* silent */ }
-    }
-
-    function pushEnabled() {
-        try {
-            window.dispatchEvent(new CustomEvent(STATE_EVENT, { detail: { enabled: isEnabled() } }));
+            var detail = JSON.stringify({ enabled: isEnabled(), debug: isDebug() });
+            window.dispatchEvent(new CustomEvent(STATE_EVENT, { detail: detail }));
         } catch (e) { /* silent */ }
     }
 
-    function injectPageHook() {
-        try {
-            if (document.documentElement && document.documentElement.dataset.yagamesAdFilter === '1') return;
-            if (!document.documentElement) { onDomAvailable(injectPageHook); return; }
-            var script = document.createElement('script');
-            script.textContent = '(' + pageHook.toString() + ')();';
-            document.documentElement.appendChild(script);
-            document.documentElement.dataset.yagamesAdFilter = '1';
-            logDebug('page-world hook injected');
-        } catch (e) {
-            logWarn('page-world injection failed: ' + e);
-        }
-    }
     function onDomAvailable(fn) {
         if (document.readyState === 'loading') {
             try {
@@ -396,6 +367,41 @@
         } else {
             setTimeout(fn, 0);
         }
+    }
+
+    // --- page-world hook installation -----------------------------------------
+
+    function hookMarked() {
+        var root = document.documentElement;
+        return !!(root && root.dataset.yagamesAdFilter === '1');
+    }
+
+    function runHookHere() {
+        try { pageHook(isEnabled(), isDebug()); } catch (e) { logWarn('direct hook failed: ' + e); }
+    }
+
+    function installPageHook() {
+        var root = document.documentElement;
+        if (!root) {
+            // No DOM yet: run in this world now (effective when it is the page
+            // world) and inject into the page world once the DOM exists.
+            runHookHere();
+            onDomAvailable(installPageHook);
+            return;
+        }
+        if (hookMarked()) return;
+        try {
+            var script = document.createElement('script');
+            script.textContent = '(' + pageHook.toString() + ')(' +
+                JSON.stringify(isEnabled()) + ',' + JSON.stringify(isDebug()) + ');';
+            root.appendChild(script);
+            if (script.parentNode) script.parentNode.removeChild(script);
+        } catch (e) {
+            logWarn('inline <script> injection threw: ' + e);
+        }
+        if (hookMarked()) { logDebug('page-world hook injected'); return; }
+        logWarn('inline <script> did not run (CSP?); running hook in userscript world');
+        runHookHere();
     }
 
     // --- host context: CSS fallback + menu ----------------------------------
@@ -422,36 +428,53 @@
         }
     }
 
-    function registerMenu() {
+    function renderMenu() {
         try {
             if (typeof GM_registerMenuCommand !== 'function') return;
-            GM_registerMenuCommand(MENU_TITLE, function () {
-                var next = !isEnabled();
-                setEnabled(next);
-                if (next) installHostStyle(); else removeHostStyle();
-                pushEnabled();
-                logDebug('suppression ' + (next ? 'enabled' : 'disabled'));
-            });
+            if (typeof GM_unregisterMenuCommand === 'function') {
+                menuIds.forEach(function (id) {
+                    try { GM_unregisterMenuCommand(id); } catch (e) { /* stale id */ }
+                });
+                menuIds = [];
+            } else if (menuIds.length) {
+                return; // cannot relabel without unregister; keep the first registration
+            }
+            var enabled = isEnabled();
+            var debug = isDebug();
+            menuIds.push(GM_registerMenuCommand(
+                (enabled ? '✅ Ad suppression: ON' : '⛔ Ad suppression: OFF') + ' (click to toggle)',
+                function () { writeFlag(ENABLED_KEY, !isEnabled()); applyState(); }
+            ));
+            menuIds.push(GM_registerMenuCommand(
+                (debug ? '🐞 Debug log: ON' : '🐞 Debug log: OFF') + ' (click to toggle)',
+                function () { writeFlag(DEBUG_KEY, !isDebug()); applyState(); }
+            ));
         } catch (e) {
             logWarn('menu registration failed: ' + e);
         }
     }
 
+    // Idempotent: re-applies stored state to CSS, page hook, and menu.
+    function applyState() {
+        if (IS_TOP) {
+            if (isEnabled()) installHostStyle(); else removeHostStyle();
+            renderMenu();
+        }
+        pushState();
+        logDebug('suppression ' + (isEnabled() ? 'enabled' : 'disabled'));
+    }
+
     function watchStorage() {
         try {
-            if (typeof GM_addValueChangeListener === 'function') {
-                GM_addValueChangeListener(ENABLED_KEY, function () { pushEnabled(); });
-            }
+            if (typeof GM_addValueChangeListener !== 'function') return;
+            GM_addValueChangeListener(ENABLED_KEY, applyState);
+            GM_addValueChangeListener(DEBUG_KEY, applyState);
         } catch (e) { /* silent */ }
     }
 
     // --- bootstrap ----------------------------------------------------------
 
-    injectPageHook();
-    pushEnabled();
-    if (window.top === window) {
-        installHostStyle();
-        registerMenu();
-    }
+    installPageHook();
+    applyState();
     watchStorage();
 })();
